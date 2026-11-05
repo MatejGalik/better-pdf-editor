@@ -1,3 +1,5 @@
+<img src="static/logo.svg" alt="logo" width="120" align="right">
+
 # PDF Editor
 
 Lokálny editor PDF (napr. stiahnutých prezentácií). Beží v prehliadači, súbory nikam neodchádzajú.

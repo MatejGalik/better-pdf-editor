@@ -304,7 +304,8 @@ body.has-doc #empty { display: none; }
 }
 .empty-box h1 { margin: 10px 0 6px; font-size: 26px; }
 .empty-box p { color: var(--muted); margin: 0 0 22px; }
-.empty-icon svg { width: 54px; height: 54px; color: var(--accent); }
+.empty-logo { display: block; margin: 0 auto; width: 120px; height: 120px; }
+.brand { width: 32px; height: 32px; margin-right: 4px; flex: none; }
 body:not(.has-doc) #sidebar, body:not(.has-doc) #status { visibility: hidden; }
 
 /* status */
