@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Editor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z' fill='%232f6fed'/%3E%3Cpath d='M14 2v6h6' fill='%23a9c2ff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="toolbar">
+  <div class="group">
+    <button id="btnOpen" data-icon="open" title="Otvoriť PDF (Ctrl+O)">Otvoriť</button>
+    <button id="btnSave" data-icon="save" title="Uložiť / stiahnuť PDF (Ctrl+S)" class="primary">Uložiť</button>
+  </div>
+  <div class="group">
+    <button id="btnUndo" data-icon="undo" title="Späť (Ctrl+Z)"></button>
+    <button id="btnRedo" data-icon="redo" title="Znova (Ctrl+Y)"></button>
+  </div>
+  <div class="group tools" id="tools">
+    <button data-tool="select" data-icon="select" title="Výber anotácií (V)"></button>
+    <button data-tool="edit" data-icon="edit" title="Upraviť existujúci text (T)"></button>
+    <button data-tool="text" data-icon="text" title="Pridať nový text (N)"></button>
+    <span class="sep"></span>
+    <button data-tool="highlight" data-icon="highlight" title="Zvýrazniť text (H)"></button>
+    <button data-tool="underline" data-icon="underline" title="Podčiarknuť text (U)"></button>
+    <button data-tool="strike" data-icon="strike" title="Prečiarknuť text (S)"></button>
+    <span class="sep"></span>
+    <button data-tool="pen" data-icon="pen" title="Pero (P)"></button>
+    <button data-tool="rect" data-icon="rect" title="Obdĺžnik (R)"></button>
+    <button data-tool="ellipse" data-icon="ellipse" title="Elipsa (E)"></button>
+    <button data-tool="arrow" data-icon="arrow" title="Šípka (A)"></button>
+    <button data-tool="note" data-icon="note" title="Poznámka / komentár (K)"></button>
+    <button data-tool="whiteout" data-icon="eraser" title="Vymazať oblasť (W) – odstráni všetko vo vybranom obdĺžniku"></button>
+  </div>
+  <div class="group">
+    <label class="color-pick" title="Farba nástroja"><input type="color" id="toolColor" value="#ffd400"></label>
+    <select id="toolWidth" title="Hrúbka čiary">
+      <option value="1">1 pt</option><option value="2">2 pt</option>
+      <option value="3" selected>3 pt</option><option value="5">5 pt</option><option value="8">8 pt</option>
+    </select>
+  </div>
+  <div class="group recolor" title="Zmení farbu celého textu na stránke – pôvodné písmo ostane zachované">
+    <span class="lbl">Farba textu</span>
+    <label class="color-pick"><input type="color" id="recolorColor" value="#ffffff"></label>
+    <label class="chk"><input type="checkbox" id="recolorAll"> všetky strany</label>
+    <button id="btnRecolor" data-icon="palette">Prefarbiť</button>
+  </div>
+  <div class="group zoom">
+    <button id="btnZoomOut" title="Oddialiť">−</button>
+    <span id="zoomLabel">100 %</span>
+    <button id="btnZoomIn" title="Priblížiť">+</button>
+    <button id="btnFit" title="Prispôsobiť šírke" data-icon="fit"></button>
+  </div>
+</header>
+
+<div id="app">
+  <aside id="sidebar">
+    <div class="side-actions">
+      <button data-page-op="rotl" data-icon="rotl" title="Otočiť doľava"></button>
+      <button data-page-op="rotr" data-icon="rotr" title="Otočiť doprava"></button>
+      <button data-page-op="up" data-icon="up" title="Posunúť stránku vyššie"></button>
+      <button data-page-op="down" data-icon="down" title="Posunúť stránku nižšie"></button>
+      <button data-page-op="duplicate" data-icon="copy" title="Duplikovať stránku"></button>
+      <button data-page-op="blank" data-icon="plus" title="Vložiť prázdnu stránku za aktuálnu"></button>
+      <button data-page-op="delete" data-icon="trash" title="Zmazať stránku" class="danger"></button>
+      <button id="btnMerge" data-icon="merge" title="Pripojiť ďalšie PDF na koniec"></button>
+    </div>
+    <div id="thumbs"></div>
+  </aside>
+
+  <main id="viewer">
+    <div id="empty">
+      <div class="empty-box">
+        <div class="empty-icon" data-icon="file"></div>
+        <h1>PDF Editor</h1>
+        <p>Otvor PDF (napr. stiahnutú prezentáciu) alebo ho sem pretiahni myšou.</p>
+        <button id="btnOpen2" class="primary big">Otvoriť PDF</button>
+      </div>
+    </div>
+    <div id="pages"></div>
+  </main>
+</div>
+
+<footer id="status">
+  <span id="hint"></span>
+  <span id="pageInfo"></span>
+</footer>
+
+<input type="file" id="fileOpen" accept="application/pdf,.pdf" hidden>
+<input type="file" id="fileMerge" accept="application/pdf,.pdf" hidden>
+<div id="toasts"></div>
+<div id="dropOverlay">Pusti PDF sem</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
