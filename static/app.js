@@ -32,6 +32,7 @@ const ICONS = {
   merge: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M12 12v6M9 15h6"/>',
   file: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6M8 13h8M8 17h5"/>',
   check: '<path d="M5 12l5 5L20 7"/>',
+  plus2: '<path d="M12 5v14M5 12h14"/>',
   x: '<path d="M6 6l12 12M18 6L6 18"/>',
 };
 function icon(name) {
@@ -45,8 +46,13 @@ document.querySelectorAll('[data-icon]').forEach(el => el.insertAdjacentHTML('af
 const $ = (s, el = document) => el.querySelector(s);
 const SVGNS = 'http://www.w3.org/2000/svg';
 
+const EMPTY_INFO = { open: false, pages: [], version: 0 };
+
 const st = {
-  info: { open: false, pages: [], version: 0 },
+  info: EMPTY_INFO,   // detail aktívneho dokumentu (z /api/docs/<id>)
+  docId: null,        // ID aktívneho dokumentu (záložky)
+  docs: [],           // záložky: [{id, name, pageCount, dirty}]
+  views: {},          // id -> {zoom, fitMode, current, scrollTop} – stav zobrazenia pri prepínaní
   fonts: [],
   zoom: 1,            // px na 1 pt
   fitMode: true,
@@ -92,8 +98,18 @@ function setBusy(b) {
   document.body.classList.toggle('busy', b);
 }
 
-async function api(path, { json, form } = {}) {
-  const opt = { method: json || form ? 'POST' : 'GET' };
+/** Základ URL pre operácie nad aktívnym dokumentom. */
+function docBase(id = st.docId) {
+  return `/api/docs/${id}`;
+}
+
+/** Jednoznačná pečiatka stavu: dokument + verzia (na zahodenie neaktuálnych odpovedí). */
+function stamp() {
+  return `${st.docId}:${st.info.version}`;
+}
+
+async function api(path, { json, form, method } = {}) {
+  const opt = { method: method || (json || form ? 'POST' : 'GET') };
   if (json) {
     opt.headers = { 'Content-Type': 'application/json' };
     opt.body = JSON.stringify(json);
@@ -106,11 +122,14 @@ async function api(path, { json, form } = {}) {
   return data;
 }
 
-async function mutate(path, payload, isForm = false) {
-  if (st.busy) return null;
+/** Zmena aktívneho dokumentu; `op` je relatívna cesta, napr. 'annot' -> /api/docs/<id>/annot. */
+async function mutate(op, payload, isForm = false) {
+  if (st.busy || !st.docId) return null;
+  const id = st.docId;
   setBusy(true);
   try {
-    const info = await api(path, isForm ? { form: payload } : { json: payload });
+    const info = await api(`${docBase(id)}/${op}`, isForm ? { form: payload } : { json: payload });
+    if (st.docId !== id) return null;   // medzitým sa prepla záložka
     applyInfo(info);
     return info;
   } catch (e) {
@@ -146,10 +165,15 @@ function applyInfo(info) {
   document.body.classList.toggle('has-doc', !!info.open);
   document.title = info.open ? `${info.name} – PDF Editor` : 'PDF Editor';
   if (info.open && st.current >= info.pages.length) st.current = info.pages.length - 1;
+  if (info.open) {
+    const tab = st.docs.find(d => d.id === info.id);
+    if (tab) Object.assign(tab, { name: info.name, pageCount: info.pageCount, dirty: info.dirty });
+  }
   if (st.fitMode) computeFit();
   updateControls();
   syncPages();
   syncThumbs();
+  renderTabs();
   refreshVisible();
 }
 
@@ -228,26 +252,26 @@ function refreshVisible() {
 function ensureImage(i) {
   const el = pageEl(i);
   const scale = renderScale();
-  const key = `${st.info.version}@${scale}`;
+  const key = `${stamp()}@${scale}`;
   if (el.dataset.key === key) return;
   el.dataset.key = key;
-  const url = `/api/page/${i}.png?scale=${scale}&v=${st.info.version}`;
+  const url = `${docBase()}/page/${i}.png?scale=${scale}&v=${st.info.version}`;
   const img = new Image();
   img.onload = () => { if (el.dataset.key === key) $('img.render', el).src = url; };
   img.src = url;
 }
 
 async function ensureData(i) {
-  const ver = st.info.version;
+  const ver = stamp();
   if (st.pageData[i] || st.dataPending[i] === ver) return;
   st.dataPending[i] = ver;
   try {
-    const d = await api(`/api/page/${i}/data?v=${ver}`);
-    if (st.info.version !== ver) return;
+    const d = await api(`${docBase()}/page/${i}/data?v=${st.info.version}`);
+    if (stamp() !== ver) return;
     st.pageData[i] = d;
     renderOverlay(i);
   } catch (e) {
-    if (st.info.version === ver) toast(e.message, 'error');
+    if (stamp() === ver) toast(e.message, 'error');
   } finally {
     if (st.dataPending[i] === ver) delete st.dataPending[i];
   }
@@ -302,7 +326,7 @@ function syncThumbs() {
     }
     t.dataset.i = i;
     const scale = Math.max(0.1, Math.min(1, 300 / Math.max(p.w, p.h)));
-    const src = `/api/page/${i}.png?scale=${scale.toFixed(3)}&v=${st.info.version}`;
+    const src = `${docBase()}/page/${i}.png?scale=${scale.toFixed(3)}&v=${st.info.version}`;
     const img = $('img', t);
     img.style.aspectRatio = `${p.w} / ${p.h}`;
     if (img.getAttribute('src') !== src) img.src = src;
@@ -431,7 +455,7 @@ function onPointerDown(ev, i) {
   }
   if (tool === 'note') {
     const text = prompt('Text poznámky:');
-    if (text !== null && text.trim()) mutate('/api/annot', { page: i, type: 'note', point: [p.x, p.y], text, color });
+    if (text !== null && text.trim()) mutate('annot', { page: i, type: 'note', point: [p.x, p.y], text, color });
     return;
   }
 
@@ -476,7 +500,7 @@ function onPointerUp(ev, i) {
 
   if (['highlight', 'underline', 'strike'].includes(d.tool)) {
     const rects = selectionRects(st.pageData[i].words, d.start, d.end);
-    mutate('/api/annot', { page: i, type: d.tool, rects, color })
+    mutate('annot', { page: i, type: d.tool, rects, color })
       .finally(() => { preview.innerHTML = ''; });
     return;
   }
@@ -486,15 +510,15 @@ function onPointerUp(ev, i) {
   const tiny = rect[2] - rect[0] < 3 && rect[3] - rect[1] < 3;
   let req = null;
   if (d.tool === 'pen') {
-    if (d.points.length > 1) req = mutate('/api/annot', { page: i, type: 'ink', strokes: [d.points.map(q => [q.x, q.y])], color, width });
+    if (d.points.length > 1) req = mutate('annot', { page: i, type: 'ink', strokes: [d.points.map(q => [q.x, q.y])], color, width });
   } else if (tiny) {
     // príliš malé – ignoruj
   } else if (d.tool === 'rect' || d.tool === 'ellipse') {
-    req = mutate('/api/annot', { page: i, type: d.tool, rect, color, width });
+    req = mutate('annot', { page: i, type: d.tool, rect, color, width });
   } else if (d.tool === 'arrow') {
-    req = mutate('/api/annot', { page: i, type: 'arrow', p1: [p0.x, p0.y], p2: [p1.x, p1.y], color, width });
+    req = mutate('annot', { page: i, type: 'arrow', p1: [p0.x, p0.y], p2: [p1.x, p1.y], color, width });
   } else if (d.tool === 'whiteout') {
-    req = mutate('/api/whiteout', { page: i, rect, color });
+    req = mutate('whiteout', { page: i, rect, color });
   }
   if (req) req.finally(() => { preview.innerHTML = ''; });
   else preview.innerHTML = '';
@@ -586,7 +610,7 @@ function showAnnotBar(i, a) {
     ed.innerHTML = icon('note') + 'Upraviť text';
     ed.onclick = () => {
       const t = prompt('Text poznámky:', a.content || '');
-      if (t !== null) mutate('/api/annot/update', { page: i, xref: a.xref, content: t });
+      if (t !== null) mutate('annot/update', { page: i, xref: a.xref, content: t });
     };
     bar.appendChild(ed);
   }
@@ -602,7 +626,7 @@ function showAnnotBar(i, a) {
 function deleteSelectedAnnot() {
   const s = st.selAnnot;
   if (!s) return;
-  mutate('/api/annot/delete', { page: s.page, xref: s.xref });
+  mutate('annot/delete', { page: s.page, xref: s.xref });
 }
 
 /* =========================================================================
@@ -706,10 +730,11 @@ function openEditor(opts) {
   setTimeout(() => { ta.focus(); if (mode === 'edit') ta.select(); }, 0);
 }
 
+/** Zavrie editor; so save=true ho najprv uloží. Vracia Promise (dá sa počkať na uloženie). */
 function closeEditor(save) {
   const ed = st.editor;
-  if (!ed) return;
-  if (save) { commitEditor(); return; }
+  if (!ed) return Promise.resolve();
+  if (save) return Promise.resolve(commitEditor());
   st.editor = null;
   ed.wrap.remove();
   renderOverlay(ed.page);
@@ -727,7 +752,7 @@ function commitEditor() {
 
   const font = { size: s.size, color: s.color, family: s.family, bold: s.bold, italic: s.italic };
   if (ed.mode === 'edit') {
-    mutate('/api/edit_text', { page: ed.page, ubbox: ed.line.ubbox, origin: ed.line.origin, text: s.text, align: s.align, ...font });
+    return mutate('edit_text', { page: ed.page, ubbox: ed.line.ubbox, origin: ed.line.origin, text: s.text, align: s.align, ...font });
   } else {
     if (!s.text.trim()) { renderOverlay(ed.page); return; }
     try {
@@ -735,25 +760,128 @@ function commitEditor() {
       localStorage.setItem('pe.color', s.color);
       localStorage.setItem('pe.family', s.family);
     } catch { /* bez úložiska */ }
-    mutate('/api/insert_text', { page: ed.page, point: [s.x, s.y], text: s.text, ...font });
+    return mutate('insert_text', { page: ed.page, point: [s.x, s.y], text: s.text, ...font });
   }
 }
 
 /* =========================================================================
    Súbor, späť/znova, stránky, prefarbenie
    ========================================================================= */
-async function openFile(file) {
-  if (!file) return;
-  if (st.info.open && st.info.canUndo && !confirm('Neuložené zmeny v aktuálnom dokumente sa stratia. Pokračovať?')) return;
+const isPdf = f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf';
+
+/** Otvorí jeden alebo viac PDF – každé do vlastnej záložky. */
+async function openFiles(fileList) {
+  const files = [...fileList].filter(isPdf);
+  if (!files.length) { toast('Vyber PDF súbor.', 'error'); return; }
+  if (st.busy) return;
+  await closeEditor(true);
   const fd = new FormData();
-  fd.append('file', file);
-  st.current = 0;
-  const info = await mutate('/api/open', fd, true);
-  if (info) { viewer.scrollTop = 0; toast(`Otvorené: ${file.name}`); }
+  files.forEach(f => fd.append('file', f));
+  setBusy(true);
+  let res;
+  try {
+    res = await api('/api/docs', { form: fd });
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  } finally {
+    setBusy(false);
+  }
+  for (const info of res.opened) {
+    st.docs.push({ id: info.id, name: info.name, pageCount: info.pageCount, dirty: info.dirty });
+  }
+  (res.errors || []).forEach(m => toast(m, 'error'));
+  const last = res.opened[res.opened.length - 1];
+  await switchDoc(last.id, last);
+  toast(res.opened.length === 1 ? `Otvorené: ${last.name}` : `Otvorené súbory: ${res.opened.length}`);
+}
+
+/** Zapamätá si zoom/scroll aktívnej záložky, aby sa po návrate obnovili. */
+function saveView() {
+  if (!st.docId) return;
+  st.views[st.docId] = { zoom: st.zoom, fitMode: st.fitMode, current: st.current, scrollTop: viewer.scrollTop };
+}
+
+function clearViewer() {
+  [...pagesEl.children].forEach(el => io.unobserve(el));
+  pagesEl.innerHTML = '';
+  thumbsEl.innerHTML = '';
+  visible.clear();
+}
+
+/** Prepne na záložku `id`. `info` = už načítaný detail (nepovinné). */
+async function switchDoc(id, info = null) {
+  if (st.busy || (id === st.docId && !info)) return;
+  await closeEditor(true);
+  if (!info) {
+    try {
+      info = await api(docBase(id));
+    } catch (e) {
+      toast(e.message, 'error');
+      return;
+    }
+  }
+  saveView();
+  st.docId = id;
+  try { sessionStorage.setItem('pe.doc', id); } catch { /* bez úložiska */ }
+  const v = st.views[id] || { zoom: st.zoom, fitMode: true, current: 0, scrollTop: 0 };
+  st.zoom = v.zoom;
+  st.fitMode = v.fitMode;
+  st.current = v.current;
+  clearViewer();
+  applyInfo(info);
+  viewer.scrollTop = v.scrollTop;
+}
+
+/** Zatvorí záložku (pri neuložených zmenách sa opýta). */
+async function closeDoc(id) {
+  const tab = st.docs.find(d => d.id === id);
+  if (!tab || st.busy) return;
+  if (tab.dirty && !confirm(`„${tab.name}“ má neuložené zmeny. Zavrieť bez uloženia?`)) return;
+  if (id === st.docId) await closeEditor(false);
+  try { await api(docBase(id), { method: 'DELETE' }); } catch { /* na serveri už nie je */ }
+  const idx = st.docs.indexOf(tab);
+  st.docs.splice(idx, 1);
+  delete st.views[id];
+  if (id !== st.docId) { renderTabs(); return; }
+  st.docId = null;
+  const next = st.docs[idx] || st.docs[idx - 1];
+  if (next) {
+    await switchDoc(next.id);
+  } else {
+    clearViewer();
+    applyInfo(EMPTY_INFO);
+  }
+}
+
+function renderTabs() {
+  const bar = $('#tabs');
+  bar.innerHTML = '';
+  document.body.classList.toggle('has-tabs', st.docs.length > 0);
+  st.docs.forEach((d, k) => {
+    const t = document.createElement('div');
+    t.className = 'tab' + (d.id === st.docId ? ' active' : '') + (d.dirty ? ' dirty' : '');
+    t.title = `${d.name} · ${d.pageCount} str.${d.dirty ? ' · neuložené zmeny' : ''}${k < 9 ? ` (Alt+${k + 1})` : ''}`;
+    t.innerHTML = `<span class="tab-name"></span><span class="tab-dot" title="Neuložené zmeny"></span>
+      <button class="tab-close" title="Zavrieť">${icon('x')}</button>`;
+    $('.tab-name', t).textContent = d.name;
+    t.addEventListener('click', () => switchDoc(d.id));
+    t.addEventListener('auxclick', e => { if (e.button === 1) { e.preventDefault(); closeDoc(d.id); } });
+    $('.tab-close', t).addEventListener('click', e => { e.stopPropagation(); closeDoc(d.id); });
+    bar.appendChild(t);
+  });
+  const add = document.createElement('button');
+  add.className = 'tab-add';
+  add.title = 'Otvoriť ďalšie PDF';
+  add.innerHTML = icon('plus2');
+  add.onclick = () => $('#fileOpen').click();
+  bar.appendChild(add);
+  const active = $('.tab.active', bar);
+  if (active) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 
 $('#btnOpen').onclick = $('#btnOpen2').onclick = () => $('#fileOpen').click();
-$('#fileOpen').onchange = e => { openFile(e.target.files[0]); e.target.value = ''; };
+$('#fileOpen').onchange = e => { const f = [...e.target.files]; e.target.value = ''; openFiles(f); };
 $('#btnMerge').onclick = () => $('#fileMerge').click();
 $('#fileMerge').onchange = async e => {
   const f = e.target.files[0];
@@ -761,24 +889,28 @@ $('#fileMerge').onchange = async e => {
   if (!f) return;
   const fd = new FormData();
   fd.append('file', f);
-  if (await mutate('/api/merge', fd, true)) toast(`Pripojené: ${f.name}`);
+  if (await mutate('merge', fd, true)) toast(`Pripojené: ${f.name}`);
 };
 
-function save() {
+async function save() {
   if (!st.info.open) return;
-  closeEditor(true);
+  await closeEditor(true);
   const a = document.createElement('a');
-  a.href = '/api/download?v=' + st.info.version;
+  a.href = `${docBase()}/download?v=${st.info.version}`;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  st.savedVersion = st.info.version;
+  // server si pri stiahnutí označí dokument ako uložený
+  st.info.dirty = false;
+  const tab = st.docs.find(d => d.id === st.docId);
+  if (tab) tab.dirty = false;
+  renderTabs();
   toast('Ukladám PDF…');
 }
 $('#btnSave').onclick = save;
 
-const undo = () => { closeEditor(false); if (st.info.canUndo) mutate('/api/undo', {}); };
-const redo = () => { closeEditor(false); if (st.info.canRedo) mutate('/api/redo', {}); };
+const undo = () => { closeEditor(false); if (st.info.canUndo) mutate('undo', {}); };
+const redo = () => { closeEditor(false); if (st.info.canRedo) mutate('redo', {}); };
 $('#btnUndo').onclick = undo;
 $('#btnRedo').onclick = redo;
 
@@ -796,7 +928,7 @@ document.querySelectorAll('[data-page-op]').forEach(b => b.addEventListener('cli
     if (!confirm(`Zmazať stranu ${i + 1}?`)) return;
     body = { op: 'delete', page: i };
   } else body = { op, page: i };
-  const info = await mutate('/api/pages', body);
+  const info = await mutate('pages', body);
   if (!info) return;
   if (op === 'up') st.current = i - 1;
   if (op === 'down') st.current = i + 1;
@@ -810,7 +942,7 @@ $('#btnRecolor').onclick = async () => {
   if (!st.info.open) return;
   const all = $('#recolorAll').checked;
   if (all && !confirm('Zmeniť farbu textu na všetkých stranách?')) return;
-  const info = await mutate('/api/recolor', { page: st.current, all, color: $('#recolorColor').value });
+  const info = await mutate('recolor', { page: st.current, all, color: $('#recolorColor').value });
   if (info) toast(all ? 'Farba textu zmenená na všetkých stranách.' : `Farba textu zmenená na strane ${st.current + 1}.`);
 };
 
@@ -823,6 +955,11 @@ document.addEventListener('keydown', e => {
   const mod = e.ctrlKey || e.metaKey;
   if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); save(); return; }
   if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); $('#fileOpen').click(); return; }
+  if (e.altKey && /^[1-9]$/.test(e.key)) {          // Alt+1..9 = prepnúť záložku
+    const d = st.docs[+e.key - 1];
+    if (d) { e.preventDefault(); switchDoc(d.id); }
+    return;
+  }
   if (typing) return;
   if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
@@ -844,21 +981,27 @@ window.addEventListener('drop', e => {
   e.preventDefault();
   dragDepth = 0;
   document.body.classList.remove('dragging');
-  const f = [...e.dataTransfer.files].find(f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf');
-  if (f) openFile(f); else toast('Pretiahni PDF súbor.', 'error');
+  openFiles(e.dataTransfer.files);
 });
 
+// Dokumenty žijú na serveri, obnovenie stránky ich nestratí – varujeme len pre istotu.
 window.addEventListener('beforeunload', e => {
-  if (st.info.open && st.info.canUndo && st.savedVersion !== st.info.version) { e.preventDefault(); e.returnValue = ''; }
+  if (st.docs.some(d => d.dirty)) { e.preventDefault(); e.returnValue = ''; }
 });
 
 /* ---------- štart ---------- */
 (async () => {
   setTool('edit');
   try {
-    const info = await api('/api/doc');
-    st.fonts = info.fonts || [];
-    applyInfo(info);
+    // obnoví záložky, ktoré sú na serveri ešte otvorené (napr. po F5)
+    const res = await api('/api/docs');
+    st.fonts = res.fonts || [];
+    st.docs = res.docs;
+    let last = null;
+    try { last = sessionStorage.getItem('pe.doc'); } catch { /* bez úložiska */ }
+    const first = st.docs.find(d => d.id === last) || st.docs[0];
+    if (first) await switchDoc(first.id);
+    else applyInfo(EMPTY_INFO);
   } catch (e) {
     toast('Server nebeží: ' + e.message, 'error');
   }

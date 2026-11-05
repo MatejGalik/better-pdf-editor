@@ -54,6 +54,8 @@
   </div>
 </header>
 
+<nav id="tabs" aria-label="Otvorené dokumenty"></nav>
+
 <div id="app">
   <aside id="sidebar">
     <div class="side-actions">
@@ -74,7 +76,7 @@
       <div class="empty-box">
         <div class="empty-icon" data-icon="file"></div>
         <h1>PDF Editor</h1>
-        <p>Otvor PDF (napr. stiahnutú prezentáciu) alebo ho sem pretiahni myšou.</p>
+        <p>Otvor jedno alebo viac PDF (napr. stiahnuté prezentácie) alebo ich sem pretiahni myšou.</p>
         <button id="btnOpen2" class="primary big">Otvoriť PDF</button>
       </div>
     </div>
@@ -87,7 +89,7 @@
   <span id="pageInfo"></span>
 </footer>
 
-<input type="file" id="fileOpen" accept="application/pdf,.pdf" hidden>
+<input type="file" id="fileOpen" accept="application/pdf,.pdf" multiple hidden>
 <input type="file" id="fileMerge" accept="application/pdf,.pdf" hidden>
 <div id="toasts"></div>
 <div id="dropOverlay">Pusti PDF sem</div>

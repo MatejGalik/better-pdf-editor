@@ -19,6 +19,11 @@ Dvojklik na `start.bat`. Prvý štart pripraví Python prostredie, potom sa edit
 
 Ďalej: Späť/Znova (Ctrl+Z / Ctrl+Y), uloženie (Ctrl+S), zoom (Ctrl+koliesko), otáčanie, presúvanie, duplikovanie, mazanie a vkladanie strán, pripojenie ďalšieho PDF.
 
+**Viac dokumentov naraz:** v dialógu „Otvoriť“ označ viac súborov (alebo ich pretiahni myšou). Každý dostane vlastnú záložku s vlastnou históriou Späť/Znova. Prepínanie: klik na záložku alebo Alt+1…9. Zatvorenie: × alebo stredné tlačidlo myši. Oranžová bodka = neuložené zmeny. Záložky prežijú obnovenie stránky (F5), nie však reštart servera.
+
+## Pre vývojárov
+Pozri [CLAUDE.md](CLAUDE.md) a priečinok [docs/](docs/): [architektúra](docs/architektura.md), [API](docs/api.md), [úprava textu a prefarbenie](docs/uprava-textu.md).
+
 ## Obmedzenia
 - Upravený text sa píše systémovým fontom najbližším pôvodnému (Calibri, Arial, Times…), keďže PDF často obsahuje iba orezaný font.
 - Úpravy sú po riadkoch; dlhší text sa automaticky nezalamuje.

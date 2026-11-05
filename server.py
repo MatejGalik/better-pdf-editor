@@ -11,10 +11,12 @@ import os
 import re
 import sys
 import threading
+import uuid
 import webbrowser
 
 import pymupdf
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Blueprint, Flask, g, jsonify, request, send_file, send_from_directory
+from werkzeug.local import LocalProxy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -25,15 +27,36 @@ app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 lock = threading.RLock()
 
 
-class State:
-    doc: pymupdf.Document | None = None
-    name = "dokument.pdf"
-    undo: list[bytes] = []
-    redo: list[bytes] = []
-    version = 0
+class DocState:
+    """Jeden otvorený dokument (jedna záložka v prehliadači)."""
+
+    def __init__(self, doc: pymupdf.Document, name: str):
+        self.id = uuid.uuid4().hex[:12]
+        self.doc = doc
+        self.name = name
+        self.undo: list[bytes] = []
+        self.redo: list[bytes] = []
+        self.version = 1
+        self.saved_version = 1   # verzia pri otvorení / poslednom stiahnutí
 
 
-S = State()
+DOCS: dict[str, DocState] = {}   # poradie vloženia = poradie záložiek
+
+# Blueprint pre všetky operácie nad konkrétnym dokumentom: /api/docs/<doc_id>/...
+# url_value_preprocessor vyberie dokument do g.D a kód endpointov pracuje s `S`.
+dbp = Blueprint("doc", __name__, url_prefix="/api/docs/<doc_id>")
+
+
+@dbp.url_value_preprocessor
+def _select_doc(endpoint, values):
+    doc_id = values.pop("doc_id")
+    D = DOCS.get(doc_id)
+    if D is None:
+        raise ApiError("Dokument nie je otvorený (možno bol server reštartovaný).")
+    g.D = D
+
+
+S = LocalProxy(lambda: g.D)
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +73,6 @@ def _api_error(e):
 
 
 def require_doc() -> pymupdf.Document:
-    if S.doc is None:
-        raise ApiError("Nie je otvorený žiadny dokument.")
     return S.doc
 
 
@@ -98,18 +119,21 @@ def rect_list(r):
     return [round(r.x0, 2), round(r.y0, 2), round(r.x1, 2), round(r.y1, 2)]
 
 
-def doc_info():
-    doc = S.doc
-    if doc is None:
-        return {"open": False, "version": S.version}
+def doc_summary(D: DocState):
+    return {"id": D.id, "name": D.name, "pageCount": D.doc.page_count,
+            "dirty": D.version != D.saved_version}
+
+
+def doc_info(D: DocState | None = None):
+    D = D or g.D
     return {
+        **doc_summary(D),
         "open": True,
-        "name": S.name,
-        "version": S.version,
-        "canUndo": bool(S.undo),
-        "canRedo": bool(S.redo),
+        "version": D.version,
+        "canUndo": bool(D.undo),
+        "canRedo": bool(D.redo),
         "pages": [{"w": round(p.rect.width, 2), "h": round(p.rect.height, 2),
-                   "rotation": p.rotation} for p in doc],
+                   "rotation": p.rotation} for p in D.doc],
     }
 
 
@@ -453,37 +477,55 @@ def static_files(p):
 # Dokument
 # ---------------------------------------------------------------------------
 
-@app.get("/api/doc")
-def api_doc():
+@app.get("/api/docs")
+def api_docs():
+    """Zoznam otvorených dokumentov (záložiek) + dostupné fonty."""
     with lock:
-        info = doc_info()
-        info["fonts"] = available_families()
-        return jsonify(info)
+        return jsonify(docs=[doc_summary(D) for D in DOCS.values()],
+                       fonts=available_families())
 
 
-@app.post("/api/open")
+@app.post("/api/docs")
 def api_open():
-    f = request.files.get("file")
-    if not f:
+    """Otvorí jeden alebo viac PDF (pole formulára `file`, môže sa opakovať)."""
+    files = request.files.getlist("file")
+    if not files:
         raise ApiError("Chýba súbor.")
-    data = f.read()
-    with lock:
+    opened, errors = [], []
+    for f in files:
+        name = f.filename or "dokument.pdf"
         try:
-            doc = load_bytes(data)
-        except ApiError:
-            raise
+            doc = load_bytes(f.read())
+        except ApiError as e:
+            errors.append(f"{name}: {e}")
+            continue
         except Exception as e:
-            raise ApiError(f"Súbor sa nepodarilo otvoriť ako PDF: {e}")
-        if S.doc is not None:
-            S.doc.close()
-        S.doc = doc
-        S.name = f.filename or "dokument.pdf"
-        S.undo.clear()
-        S.redo.clear()
-        return mutated()
+            errors.append(f"{name}: súbor sa nepodarilo otvoriť ako PDF ({e})")
+            continue
+        D = DocState(doc, name)
+        with lock:
+            DOCS[D.id] = D
+        opened.append(doc_info(D))
+    if not opened:
+        raise ApiError("; ".join(errors))
+    return jsonify(opened=opened, errors=errors)
 
 
-@app.get("/api/download")
+@dbp.get("")
+def api_doc_info():
+    with lock:
+        return jsonify(doc_info())
+
+
+@dbp.delete("")
+def api_close():
+    with lock:
+        D = DOCS.pop(g.D.id)
+        D.doc.close()
+        return jsonify(ok=True)
+
+
+@dbp.get("/download")
 def api_download():
     with lock:
         doc = require_doc()
@@ -495,12 +537,13 @@ def api_download():
         data = out.tobytes(garbage=3, deflate=True, clean=False)
         out.close()
         name = S.name
+        S.saved_version = S.version
     base, _ = os.path.splitext(name)
     return send_file(io.BytesIO(data), mimetype="application/pdf",
                      as_attachment=True, download_name=f"{base}_upravene.pdf")
 
 
-@app.post("/api/undo")
+@dbp.post("/undo")
 def api_undo():
     with lock:
         if not S.undo:
@@ -511,7 +554,7 @@ def api_undo():
         return mutated()
 
 
-@app.post("/api/redo")
+@dbp.post("/redo")
 def api_redo():
     with lock:
         if not S.redo:
@@ -526,7 +569,7 @@ def api_redo():
 # Stránky – vykreslenie a dáta
 # ---------------------------------------------------------------------------
 
-@app.get("/api/page/<int:i>.png")
+@dbp.get("/page/<int:i>.png")
 def api_page_png(i):
     scale = min(max(float(request.args.get("scale", 1.5)), 0.1), 6)
     with lock:
@@ -538,7 +581,7 @@ def api_page_png(i):
     return resp
 
 
-@app.get("/api/page/<int:i>/data")
+@dbp.get("/page/<int:i>/data")
 def api_page_data(i):
     with lock:
         page = get_page(i)
@@ -601,7 +644,7 @@ def redact_text_only(page, urects):
                           text=pymupdf.PDF_REDACT_TEXT_REMOVE)
 
 
-@app.post("/api/edit_text")
+@dbp.post("/edit_text")
 def api_edit_text():
     j = request.get_json(force=True)
     with lock:
@@ -631,7 +674,7 @@ def api_edit_text():
         return mutated()
 
 
-@app.post("/api/insert_text")
+@dbp.post("/insert_text")
 def api_insert_text():
     j = request.get_json(force=True)
     with lock:
@@ -676,7 +719,7 @@ def api_insert_text():
         return mutated()
 
 
-@app.post("/api/recolor")
+@dbp.post("/recolor")
 def api_recolor():
     j = request.get_json(force=True)
     with lock:
@@ -697,7 +740,7 @@ def api_recolor():
 # Anotácie
 # ---------------------------------------------------------------------------
 
-@app.post("/api/annot")
+@dbp.post("/annot")
 def api_annot():
     j = request.get_json(force=True)
     with lock:
@@ -750,7 +793,7 @@ def api_annot():
         return mutated()
 
 
-@app.post("/api/annot/delete")
+@dbp.post("/annot/delete")
 def api_annot_delete():
     j = request.get_json(force=True)
     with lock:
@@ -764,7 +807,7 @@ def api_annot_delete():
         return mutated()
 
 
-@app.post("/api/annot/update")
+@dbp.post("/annot/update")
 def api_annot_update():
     """Zmena textu poznámky."""
     j = request.get_json(force=True)
@@ -780,7 +823,7 @@ def api_annot_update():
         return mutated()
 
 
-@app.post("/api/whiteout")
+@dbp.post("/whiteout")
 def api_whiteout():
     """Vymaže všetko v oblasti (text, obrázky, grafiku) a vyplní farbou."""
     j = request.get_json(force=True)
@@ -805,7 +848,7 @@ def api_whiteout():
 # Operácie so stránkami
 # ---------------------------------------------------------------------------
 
-@app.post("/api/pages")
+@dbp.post("/pages")
 def api_pages():
     j = request.get_json(force=True)
     with lock:
@@ -842,7 +885,7 @@ def api_pages():
         return mutated()
 
 
-@app.post("/api/merge")
+@dbp.post("/merge")
 def api_merge():
     f = request.files.get("file")
     if not f:
@@ -863,6 +906,9 @@ def api_merge():
 
 
 # ---------------------------------------------------------------------------
+
+app.register_blueprint(dbp)
+
 
 def main():
     port = int(os.environ.get("PORT", 5173))
