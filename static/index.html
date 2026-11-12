@@ -33,6 +33,7 @@
     <button data-tool="arrow" data-icon="arrow" title="Šípka (A)"></button>
     <button data-tool="note" data-icon="note" title="Poznámka / komentár (K)"></button>
     <button data-tool="whiteout" data-icon="eraser" title="Vymazať oblasť (W) – odstráni všetko vo vybranom obdĺžniku"></button>
+    <button id="btnImage" data-icon="image" title="Vložiť obrázok zo súboru (alebo Ctrl+V zo schránky)"></button>
   </div>
   <div class="group">
     <label class="color-pick" title="Farba nástroja"><input type="color" id="toolColor" value="#ffd400"></label>
@@ -87,13 +88,14 @@
 
 <footer id="status">
   <span id="hint"></span>
-  <span id="pageInfo"></span>
+  <span class="status-right"><span id="saveInfo"></span><span id="pageInfo"></span></span>
 </footer>
 
 <input type="file" id="fileOpen" accept="application/pdf,.pdf" multiple hidden>
 <input type="file" id="fileMerge" accept="application/pdf,.pdf" hidden>
+<input type="file" id="fileImage" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" hidden>
 <div id="toasts"></div>
-<div id="dropOverlay">Pusti PDF sem</div>
+<div id="dropOverlay">Pusti PDF alebo obrázok sem</div>
 
 <script src="/static/app.js"></script>
 </body>

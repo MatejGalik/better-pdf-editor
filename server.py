@@ -7,10 +7,13 @@ preto sa prepočítavajú cez page.rotation_matrix / page.derotation_matrix.
 """
 
 import io
+import json
 import os
 import re
 import sys
+import shutil
 import threading
+import time
 import uuid
 import webbrowser
 
@@ -21,6 +24,9 @@ from werkzeug.local import LocalProxy
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 MAX_UNDO = 40
+# Automatické ukladanie: po každej zmene sa dokument zapíše sem, po reštarte sa záložky obnovia.
+AUTOSAVE_DIR = os.environ.get("PDF_EDITOR_AUTOSAVE") or os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "PDF Editor", "autosave")
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
@@ -30,14 +36,17 @@ lock = threading.RLock()
 class DocState:
     """Jeden otvorený dokument (jedna záložka v prehliadači)."""
 
-    def __init__(self, doc: pymupdf.Document, name: str):
-        self.id = uuid.uuid4().hex[:12]
+    def __init__(self, doc: pymupdf.Document, name: str, doc_id: str | None = None):
+        self.id = doc_id or uuid.uuid4().hex[:12]
         self.doc = doc
         self.name = name
         self.undo: list[bytes] = []
         self.redo: list[bytes] = []
         self.version = 1
         self.saved_version = 1   # verzia pri otvorení / poslednom stiahnutí
+        self.opened = time.time()          # poradie záložiek po obnovení
+        self.autosaved: float | None = None
+        self.autosave_error: str | None = None
 
 
 DOCS: dict[str, DocState] = {}   # poradie vloženia = poradie záložiek
@@ -121,7 +130,8 @@ def rect_list(r):
 
 def doc_summary(D: DocState):
     return {"id": D.id, "name": D.name, "pageCount": D.doc.page_count,
-            "dirty": D.version != D.saved_version}
+            "dirty": D.version != D.saved_version,
+            "autosaved": D.autosaved, "autosaveError": D.autosave_error}
 
 
 def doc_info(D: DocState | None = None):
@@ -147,6 +157,7 @@ def snapshot():
 
 def mutated():
     S.version += 1
+    autosave(g.D)
     return jsonify(doc_info())
 
 
@@ -155,6 +166,72 @@ def load_bytes(data: bytes) -> pymupdf.Document:
     if doc.needs_pass:
         raise ApiError("PDF je chránené heslom.")
     return doc
+
+
+# ---------------------------------------------------------------------------
+# Automatické ukladanie (záloha na disk po každej zmene)
+# ---------------------------------------------------------------------------
+
+def _autosave_path(D: DocState) -> str:
+    return os.path.join(AUTOSAVE_DIR, D.id)
+
+
+def _write_atomic(path: str, data: bytes):
+    """Zápis cez dočasný súbor + fsync + replace: pri výpadku ostane buď starý, alebo nový súbor."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def autosave(D: DocState, meta_only: bool = False):
+    """Uloží dokument (a meta údaje) do AUTOSAVE_DIR. Volá sa pod `lock`. Chyba nezastaví úpravu."""
+    try:
+        folder = _autosave_path(D)
+        os.makedirs(folder, exist_ok=True)
+        if not meta_only:
+            _write_atomic(os.path.join(folder, "doc.pdf"), D.doc.tobytes())
+        meta = {"name": D.name, "version": D.version, "saved_version": D.saved_version,
+                "opened": D.opened}
+        _write_atomic(os.path.join(folder, "meta.json"), json.dumps(meta).encode("utf-8"))
+        D.autosaved = time.time()
+        D.autosave_error = None
+    except Exception as e:
+        D.autosave_error = f"Automatické uloženie zlyhalo: {e}"
+        print(D.autosave_error, file=sys.stderr)
+
+
+def autosave_remove(D: DocState):
+    shutil.rmtree(_autosave_path(D), ignore_errors=True)
+
+
+def autosave_restore():
+    """Pri štarte servera otvorí dokumenty zo zálohy (napr. po vypnutí notebooku)."""
+    if not os.path.isdir(AUTOSAVE_DIR):
+        return
+    found = []
+    for doc_id in os.listdir(AUTOSAVE_DIR):
+        folder = os.path.join(AUTOSAVE_DIR, doc_id)
+        try:
+            with open(os.path.join(folder, "meta.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+            with open(os.path.join(folder, "doc.pdf"), "rb") as f:
+                doc = load_bytes(f.read())
+        except Exception as e:
+            print(f"Zálohu {folder} sa nepodarilo obnoviť: {e}", file=sys.stderr)
+            continue
+        D = DocState(doc, meta.get("name") or "dokument.pdf", doc_id)
+        D.version = int(meta.get("version", 1))
+        D.saved_version = int(meta.get("saved_version", D.version))
+        D.opened = float(meta.get("opened", 0))
+        D.autosaved = os.path.getmtime(os.path.join(folder, "doc.pdf"))
+        found.append(D)
+    for D in sorted(found, key=lambda D: D.opened):
+        DOCS[D.id] = D
+    if found:
+        print(f"Obnovené dokumenty zo zálohy: {len(found)}")
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +582,7 @@ def api_open():
         D = DocState(doc, name)
         with lock:
             DOCS[D.id] = D
+            autosave(D)
         opened.append(doc_info(D))
     if not opened:
         raise ApiError("; ".join(errors))
@@ -522,6 +600,7 @@ def api_close():
     with lock:
         D = DOCS.pop(g.D.id)
         D.doc.close()
+        autosave_remove(D)
         return jsonify(ok=True)
 
 
@@ -538,6 +617,7 @@ def api_download():
         out.close()
         name = S.name
         S.saved_version = S.version
+        autosave(g.D, meta_only=True)
     base, _ = os.path.splitext(name)
     return send_file(io.BytesIO(data), mimetype="application/pdf",
                      as_attachment=True, download_name=f"{base}_upravene.pdf")
@@ -622,7 +702,7 @@ def api_page_data(i):
             annots.append({"xref": a.xref, "type": a.type[1],
                            "rect": rect_list(to_disp_rect(page, a.rect)),
                            "content": a.info.get("content", "")})
-        return jsonify(lines=lines, words=words, annots=annots)
+        return jsonify(lines=lines, words=words, annots=annots, images=page_images(page))
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +925,133 @@ def api_whiteout():
 
 
 # ---------------------------------------------------------------------------
+# Obrázky (kopírovanie, vloženie, zmazanie)
+# ---------------------------------------------------------------------------
+
+def page_images(page):
+    """Obrázky na strane (len tie s xref – inline obrázky sa kopírovať nedajú)."""
+    out = []
+    for info in page.get_image_info(xrefs=True):
+        xref = info.get("xref") or 0
+        r = pymupdf.Rect(info["bbox"]) & page.cropbox
+        if not xref or r.is_empty or r.width < 2 or r.height < 2:
+            continue
+        out.append({"xref": xref, "rect": rect_list(to_disp_rect(page, r))})
+    return out
+
+
+def image_png(doc, xref) -> bytes:
+    """Obrázok z PDF ako PNG (vrátane priehľadnosti, CMYK prevedené na RGB)."""
+    pix = pymupdf.Pixmap(doc, xref)
+    smask = doc.xref_get_key(xref, "SMask")
+    if smask[0] == "xref":
+        try:
+            mask = pymupdf.Pixmap(doc, int(smask[1].split()[0]))
+            pix = pymupdf.Pixmap(pix, mask)
+        except Exception:
+            pass   # maska v nepodporovanom formáte – vrátime obrázok bez nej
+    if pix.colorspace and pix.colorspace.n not in (1, 3):
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+    return pix.tobytes("png")
+
+
+@dbp.get("/image/<int:xref>.png")
+def api_image_png(xref):
+    with lock:
+        doc = require_doc()
+        if not 0 < xref < doc.xref_length() or doc.xref_get_key(xref, "Subtype")[1] != "/Image":
+            raise ApiError("Obrázok sa nenašiel.")
+        try:
+            png = image_png(doc, xref)
+        except Exception as e:
+            raise ApiError(f"Obrázok sa nepodarilo načítať: {e}")
+    return send_file(io.BytesIO(png), mimetype="image/png")
+
+
+@dbp.post("/insert_image")
+def api_insert_image():
+    """multipart: `file` (PNG/JPEG/…), `page`, `rect` = JSON [x0,y0,x1,y1] v zobrazenom priestore."""
+    f = request.files.get("file")
+    if not f:
+        raise ApiError("Chýba obrázok.")
+    data = f.read()
+    try:
+        r = pymupdf.Rect(json.loads(request.form.get("rect", "")))
+    except (ValueError, TypeError):
+        raise ApiError("Neplatná poloha obrázka.")
+    if r.is_empty or r.width < 1 or r.height < 1:
+        raise ApiError("Obrázok je príliš malý.")
+    try:
+        pymupdf.Pixmap(data)   # overí, že ide o obrázok, ktorý PyMuPDF prečíta
+    except Exception:
+        raise ApiError("Tento formát obrázka nie je podporovaný (použi PNG alebo JPEG).")
+    with lock:
+        page = get_page(request.form.get("page"))
+        snapshot()
+        rot = page.rotation
+        ur = to_unrot_rect(page, r)
+        if rot:
+            page.set_rotation(0)
+        try:
+            # rotate otočí obrázok proti otočeniu strany, aby bol v zobrazení vzpriamený
+            page.insert_image(ur, stream=data, keep_proportion=False, rotate=rot)
+        except Exception as e:
+            S.undo.pop()
+            raise ApiError(f"Obrázok sa nepodarilo vložiť: {e}")
+        finally:
+            if rot:
+                page.set_rotation(rot)
+        return mutated()
+
+
+def remove_image_draw(doc, page, xref, rect):
+    """Odstráni z content streamu strany vykreslenie obrázka (`/Meno Do`).
+
+    Samotný objekt obrázka ostáva (môžu ho používať iné strany). Ak je ten istý obrázok na strane
+    viackrát, zmaže sa iba výskyt s obdĺžnikom `rect` (neotočený priestor).
+    """
+    names = [im[7] for im in page.get_images(full=True) if im[0] == xref and im[-1] == 0]
+    if not names:
+        raise ApiError("Tento obrázok je vnorený v grafike strany, samostatne sa zmazať nedá.")
+    occ = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info(xrefs=True) if i.get("xref") == xref]
+    k = min(range(len(occ)), key=lambda n: sum(abs(a - b) for a, b in zip(occ[n], rect))) if occ else 0
+    page.clean_contents(sanitize=False)  # zlúči content streamy do jedného
+    cx = page.get_contents()
+    data = page.read_contents()
+    pat = re.compile(rb"/(?:%s)\s+Do\b" % b"|".join(re.escape(n.encode()) for n in names))
+    hits = list(pat.finditer(data))
+    if not hits:
+        raise ApiError("Obrázok sa v obsahu strany nenašiel.")
+    # počet výskytov sedí s get_image_info → zmažeme len vybraný, inak všetky
+    drop = [hits[k]] if len(hits) == len(occ) else hits
+    for m in reversed(drop):
+        data = data[:m.start()] + b" " + data[m.end():]
+    doc.update_stream(cx[0], data)
+    for x in cx[1:]:
+        doc.update_stream(x, b" ")
+
+
+@dbp.post("/image/delete")
+def api_image_delete():
+    """{page, xref, rect} – zmaže obrázok zo strany (rect = jeho obdĺžnik z `data.images`)."""
+    j = request.get_json(force=True)
+    with lock:
+        doc = require_doc()
+        page = get_page(j.get("page"))
+        xref = int(j.get("xref") or 0)
+        if not any(im["xref"] == xref for im in page_images(page)):
+            raise ApiError("Obrázok sa na tejto strane nenašiel.")
+        rect = to_unrot_rect(page, j["rect"]) if j.get("rect") else pymupdf.Rect()
+        snapshot()
+        try:
+            remove_image_draw(doc, page, xref, rect)
+        except Exception:
+            S.undo.pop()
+            raise
+        return mutated()
+
+
+# ---------------------------------------------------------------------------
 # Operácie so stránkami
 # ---------------------------------------------------------------------------
 
@@ -911,6 +1118,8 @@ app.register_blueprint(dbp)
 
 
 def main():
+    with lock:
+        autosave_restore()
     port = int(os.environ.get("PORT", 5173))
     url = f"http://127.0.0.1:{port}/"
     if "--no-browser" not in sys.argv:

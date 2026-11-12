@@ -7,6 +7,7 @@ Mutačné endpointy (označené ✎) vracajú **info o dokumente**:
 ```json
 { "id": "a1b2c3d4e5f6", "name": "prezentacia.pdf", "pageCount": 12, "dirty": true,
   "open": true, "version": 7, "canUndo": true, "canRedo": false,
+  "autosaved": 1762940000.5, "autosaveError": null,
   "pages": [{ "w": 960, "h": 540, "rotation": 0 }] }
 ```
 
@@ -26,7 +27,7 @@ Mutačné endpointy (označené ✎) vracajú **info o dokumente**:
 | Metóda | Cesta | Telo / popis |
 |---|---|---|
 | GET | `…/page/<i>.png?scale=1.5` | vykreslená strana (s anotáciami) |
-| GET | `…/page/<i>/data` | `{lines, words, annots}` – pozri nižšie |
+| GET | `…/page/<i>/data` | `{lines, words, annots, images}` – pozri nižšie |
 | POST ✎ | `…/pages` | `{op, page, …}`: `rotate` (`angle` ±90), `delete`, `move` (`to`), `duplicate`, `blank` |
 | POST ✎ | `…/merge` | multipart `file` – pripojí PDF na koniec |
 
@@ -35,6 +36,7 @@ Mutačné endpointy (označené ✎) vracajú **info o dokumente**:
   `ubbox` a `origin` (účiarie) sú v **neotočenom** priestore a posielajú sa späť do `edit_text`.
 - `words[]`: `[x0, y0, x1, y1, blok, riadok]` v poradí čítania.
 - `annots[]`: `{xref, type, rect, content}`.
+- `images[]`: `{xref, rect}` – obrázky na strane (inline obrázky bez xref sa neuvádzajú).
 
 ## Text
 | Metóda | Cesta | Telo |
@@ -52,3 +54,10 @@ Mutačné endpointy (označené ✎) vracajú **info o dokumente**:
 | | | `ink`: `strokes: [[[x,y]…]…]` · `rect` / `ellipse`: `rect` · `arrow`: `p1`, `p2` · `note`: `point`, `text` |
 | POST ✎ | `…/annot/delete` | `{page, xref}` |
 | POST ✎ | `…/annot/update` | `{page, xref, content}` – text poznámky |
+
+## Obrázky
+| Metóda | Cesta | Telo |
+|---|---|---|
+| GET | `…/image/<xref>.png` | obrázok z PDF ako PNG (s priehľadnosťou, CMYK → RGB) – na kopírovanie do schránky |
+| POST ✎ | `…/insert_image` | multipart: `file` (PNG/JPEG), `page`, `rect` = JSON `[x0,y0,x1,y1]`; obrázok sa roztiahne na `rect`, na otočenej strane ostane vzpriamený |
+| POST ✎ | `…/image/delete` | `{page, xref, rect}` – odstráni z content streamu strany iba toto vykreslenie (`/Meno Do`); objekt obrázka ostáva pre iné strany |

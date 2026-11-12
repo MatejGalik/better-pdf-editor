@@ -25,6 +25,8 @@ Prvé nastavenie: `python -m venv .venv` a `.venv\Scripts\pip install -r require
 - **Viac dokumentov:** endpointy nad dokumentom patria do blueprintu `dbp` (`/api/docs/<doc_id>/...`);
   `S` je proxy na aktuálny `DocState` (`g.D`). Nový endpoint = `@dbp.post("/nieco")`, nie `@app`.
 - Všetko, čo siaha na `pymupdf.Document`, musí bežať pod `with lock:` (Flask je viacvláknový).
+- **Autosave:** `mutated()` po každej zmene zapíše dokument do `%LOCALAPPDATA%\PDF Editor\autosave`
+  a pri štarte sa odtiaľ záložky obnovia. Zmena mimo `mutated()` (napr. stiahnutie) volá `autosave(D)` sama.
 - **Úprava textu = redakcia (typ B):** text sa naozaj odstráni (`apply_redactions` len s `text=REMOVE`,
   obrázky/grafika ostávajú) a nový sa zapíše fontom z `C:\Windows\Fonts`. Nemeniť na „biely obdĺžnik“.
 - **Prefarbenie** prepisuje content stream (`recolor_content`), nesmie meniť fonty ani pozície textu.
@@ -32,7 +34,8 @@ Prvé nastavenie: `python -m venv .venv` a `.venv\Scripts\pip install -r require
   zahadzuje `stamp()`. Žiadne frameworky ani npm závislosti bez dohody.
 
 ## Testovanie
-Automatické testy zatiaľ nie sú. Overuj:
+Automatické testy zatiaľ nie sú. **Testy vždy s `PDF_EDITOR_AUTOSAVE=<dočasný priečinok>`**, inak zapisujú
+do skutočných záloh používateľa. Overuj:
 1. API cez `server.app.test_client()` na vygenerovanom PDF (PyMuPDF vie vytvoriť testovaciu prezentáciu).
 2. UI v prehliadači (napr. Playwright s `channel="msedge"`) – otvoriť, upraviť riadok, zvýrazniť, prefarbiť,
    prepnúť záložku, uložiť – a pozrieť sa na vykreslené PNG (`/api/docs/<id>/page/<i>.png`).

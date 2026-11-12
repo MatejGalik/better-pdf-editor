@@ -21,6 +21,14 @@ Server beží iba na `127.0.0.1`, súbory nikam neodchádzajú.
   do `g.D`. `S = LocalProxy(lambda: g.D)`, takže kód endpointov píše jednoducho `S.doc`, `S.version`…
 - Globálny `lock` (RLock) chráni všetky prístupy k dokumentom.
 
+### Automatické ukladanie
+Po každej zmene (`mutated()`), pri otvorení aj po stiahnutí sa dokument zapíše do
+`%LOCALAPPDATA%\PDF Editor\autosave\<id>\` (`doc.pdf` + `meta.json`: meno, verzia, uložená verzia,
+poradie). Zápis je atomický (dočasný súbor → `fsync` → `os.replace`), takže pri výpadku ostane buď
+starý, alebo nový stav, nikdy rozbitý súbor. Pri štarte servera `autosave_restore()` obnoví záložky
+s rovnakými ID. Zatvorenie záložky zálohu zmaže. História Späť/Znova sa **neukladá**. Priečinok sa dá
+zmeniť premennou `PDF_EDITOR_AUTOSAVE`. Chyba zápisu úpravu nezastaví, vráti sa v `autosaveError`.
+
 ### Späť / Znova
 `snapshot()` pred každou zmenou uloží `doc.tobytes()` do `undo` (max. `MAX_UNDO` = 40) a vymaže `redo`.
 Undo/redo dokument znovu otvorí z bajtov. Je to jednoduché a robustné; pri veľkých PDF to stojí pamäť
@@ -60,6 +68,12 @@ Jeden súbor bez frameworku, rozdelený komentármi na sekcie:
 3. **Nástroje** – `onPointerDown/Move/Up` na SVG vrstve; náhľad sa kreslí do `<g class="preview">`,
    trvalé prvky (rámčeky riadkov, anotácií) do `<g class="base">` cez `renderOverlay`.
    Výber textu na zvýraznenie ide po slovách (`nearestWord`, `selectionRects`) v poradí z PDF.
+   **Obrázky:** v režime výberu sa dá vybrať obrázok (`st.selImage`) → Ctrl+C / Ctrl+X ho zapíše
+   do systémovej schránky (`navigator.clipboard.write`, PNG z `/image/<xref>.png`) a zapamätá
+   v `st.imgClip` (záloha + pôvodná veľkosť v pt). Ctrl+V (udalosť `paste`), tlačidlo „Obrázok“
+   alebo pustenie obrázka myšou spustí `startPlacement`: obrázok sa zobrazí ako `.img-place`
+   (posun, zmena veľkosti rohom) a do PDF sa zapíše až po Enter / „Vložiť“ / kliku mimo
+   (`commitPlacement` → `insert_image`). Iné formáty než PNG/JPEG sa najprv prevedú cez canvas na PNG.
 4. **Textový editor** – `openEditor` / `commitEditor` / `closeEditor` (vracia Promise, aby sa dalo
    pred prepnutím záložky počkať na uloženie).
 5. **Záložky** – `openFiles` (viac súborov naraz), `switchDoc` (uloží a obnoví zoom, scroll a stranu

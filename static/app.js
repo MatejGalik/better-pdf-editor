@@ -34,6 +34,8 @@ const ICONS = {
   check: '<path d="M5 12l5 5L20 7"/>',
   plus2: '<path d="M12 5v14M5 12h14"/>',
   x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/>',
+  cut: '<circle cx="6" cy="7" r="3"/><circle cx="6" cy="17" r="3"/><path d="M8.5 8.5L20 19M8.5 15.5L20 5"/>',
 };
 function icon(name) {
   return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ''}</svg>`;
@@ -62,6 +64,10 @@ const st = {
   current: 0,
   editor: null,       // otvorený textový editor
   selAnnot: null,     // {page, xref}
+  selImage: null,     // {page, xref, rect} – vybraný obrázok v režime výberu
+  placing: null,      // vkladaný obrázok pred potvrdením (pozri startPlacement)
+  hover: null,        // {page, x, y} – posledná poloha myši nad stranou (kam vložiť Ctrl+V)
+  imgClip: null,      // naposledy skopírovaný obrázok z PDF {pw, ph, w, h, blob}
   drag: null,
   busy: false,
 };
@@ -71,7 +77,7 @@ const viewer = $('#viewer');
 const thumbsEl = $('#thumbs');
 
 const HINTS = {
-  select: 'Klikni na anotáciu (zvýraznenie, kresbu, poznámku…) a zmaž ju klávesom Delete.',
+  select: 'Klikni na anotáciu alebo obrázok · Delete = zmazať · Ctrl+C / Ctrl+X = kopírovať / vystrihnúť obrázok · Ctrl+V = vložiť obrázok.',
   edit: 'Klikni na riadok textu a uprav ho. Enter = uložiť · Shift+Enter = nový riadok · Esc = zrušiť.',
   text: 'Klikni kamkoľvek na stránku a napíš nový text.',
   highlight: 'Potiahni myšou cez text, ktorý chceš zvýrazniť.',
@@ -158,10 +164,13 @@ function isLight(hex) {
    ========================================================================= */
 function applyInfo(info) {
   closeEditor(false);
+  if (info.autosaveError && info.autosaveError !== st.info.autosaveError) toast(info.autosaveError, 'error');
   st.info = info;
   st.pageData = {};
   st.dataPending = {};
   st.selAnnot = null;
+  st.selImage = null;
+  if (st.placing && (!info.open || st.placing.page >= info.pages.length)) cancelPlacement();
   document.body.classList.toggle('has-doc', !!info.open);
   document.title = info.open ? `${info.name} – PDF Editor` : 'PDF Editor';
   if (info.open && st.current >= info.pages.length) st.current = info.pages.length - 1;
@@ -185,6 +194,18 @@ function updateControls() {
   $('#btnRecolor').disabled = !open;
   $('#zoomLabel').textContent = Math.round(st.zoom * 100) + ' %';
   $('#pageInfo').textContent = open ? `Strana ${st.current + 1} / ${st.info.pages.length}` : '';
+  const si = $('#saveInfo');
+  si.classList.toggle('error', !!st.info.autosaveError);
+  if (st.info.autosaveError) {
+    si.textContent = '⚠ ' + st.info.autosaveError;
+  } else if (open && st.info.autosaved) {
+    const t = new Date(st.info.autosaved * 1000).toLocaleTimeString('sk-SK');
+    si.textContent = `✓ Automaticky uložené ${t}`;
+    si.title = 'Každá zmena sa hneď zálohuje na disk – po reštarte servera či počítača sa záložky obnovia. '
+      + 'Hotové PDF si stiahneš tlačidlom Uložiť.';
+  } else {
+    si.textContent = '';
+  }
   document.querySelectorAll('.thumb').forEach((t, i) => t.classList.toggle('active', i === st.current));
 }
 
@@ -238,6 +259,7 @@ function syncPages() {
     $('.preview', svg).innerHTML = '';
     el.querySelectorAll('.annot-bar').forEach(b => b.remove());
   });
+  layoutPlacement();
 }
 
 function refreshVisible() {
@@ -293,6 +315,19 @@ function renderOverlay(i) {
       if (st.editor && st.editor.page === i && st.editor.line && st.editor.line.id === line.id) r.classList.add('editing');
     }
   } else if (st.tool === 'select') {
+    // obrázky pod anotáciami, aby sa dali vybrať aj anotácie nakreslené cez obrázok
+    for (const im of d.images || []) {
+      const [x0, y0, x1, y1] = im.rect;
+      const r = svgEl('rect', { class: 'image-box', x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, base);
+      r.dataset.xref = im.xref;
+      r.dataset.rect = im.rect.join(',');
+      svgEl('title', {}, r).textContent = 'Obrázok';
+      if (st.selImage && st.selImage.page === i && st.selImage.xref === im.xref &&
+          st.selImage.rect.join(',') === im.rect.join(',')) {
+        r.classList.add('selected');
+        showImageBar(i, im);
+      }
+    }
     for (const a of d.annots) {
       const [x0, y0, x1, y1] = a.rect;
       const r = svgEl('rect', { class: 'annot-box', x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, base);
@@ -424,6 +459,11 @@ function onPointerDown(ev, i) {
   st.current = i;
   updateControls();
 
+  // vkladaný obrázok: klik mimo neho ho vloží
+  if (st.placing) {
+    commitPlacement();
+    return;
+  }
   // otvorený editor: klik mimo neho ho uloží
   if (st.editor) {
     commitEditor();
@@ -449,7 +489,9 @@ function onPointerDown(ev, i) {
   }
   if (tool === 'select') {
     const target = ev.target.closest('.annot-box');
+    const img = target ? null : ev.target.closest('.image-box');
     st.selAnnot = target ? { page: i, xref: +target.dataset.xref } : null;
+    st.selImage = img ? { page: i, xref: +img.dataset.xref, rect: img.dataset.rect.split(',').map(Number) } : null;
     renderAllOverlays();
     return;
   }
@@ -477,6 +519,7 @@ function onPointerDown(ev, i) {
 }
 
 function onPointerMove(ev, i) {
+  st.hover = { page: i, ...pointFromEvent(ev, i) };
   const d = st.drag;
   if (!d || d.page !== i) return;
   const p = pointFromEvent(ev, i);
@@ -628,6 +671,227 @@ function deleteSelectedAnnot() {
   if (!s) return;
   mutate('annot/delete', { page: s.page, xref: s.xref });
 }
+
+/* =========================================================================
+   Obrázky: kopírovať / vystrihnúť / vložiť (schránka, súbor, drag & drop)
+   ========================================================================= */
+function showImageBar(i, im) {
+  const el = pageEl(i);
+  const bar = document.createElement('div');
+  bar.className = 'annot-bar';
+  bar.style.left = im.rect[0] * st.zoom + 'px';
+  bar.style.top = Math.max(0, im.rect[1] * st.zoom - 46) + 'px';
+  bar.innerHTML = `<button class="copy" title="Kopírovať (Ctrl+C)">${icon('copy')}Kopírovať</button>
+    <button class="cut" title="Vystrihnúť (Ctrl+X)">${icon('cut')}Vystrihnúť</button>
+    <button class="del danger" title="Zmazať (Delete)">${icon('trash')}Zmazať</button>`;
+  $('.copy', bar).onclick = () => copyImage(false);
+  $('.cut', bar).onclick = () => copyImage(true);
+  $('.del', bar).onclick = deleteSelectedImage;
+  bar.addEventListener('pointerdown', e => e.stopPropagation());
+  el.appendChild(bar);
+}
+
+function deleteSelectedImage() {
+  const s = st.selImage;
+  if (!s) return Promise.resolve(null);
+  return mutate('image/delete', { page: s.page, xref: s.xref, rect: s.rect });
+}
+
+/** Rozmery obrázka v pixeloch (a overenie, že ho prehliadač vie dekódovať). */
+function imageSize(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve({ w: img.naturalWidth, h: img.naturalHeight, img }); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Obrázok sa nepodarilo načítať.')); };
+    img.src = url;
+  });
+}
+
+/** Skopíruje vybraný obrázok do schránky (so cut=true ho potom zo strany zmaže). */
+async function copyImage(cut = false) {
+  const s = st.selImage;
+  if (!s) return;
+  const url = `${docBase()}/image/${s.xref}.png?v=${st.info.version}`;
+  const blobP = fetch(url).then(async r => {
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Obrázok sa nepodarilo načítať.');
+    return r.blob();
+  });
+  let sys = true;
+  try {
+    // promise priamo v ClipboardItem – zápis tak ostane v rámci gesta používateľa
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blobP })]);
+  } catch {
+    sys = false;   // bez prístupu k schránke – obrázok si aspoň zapamätáme v editore
+  }
+  let blob, size;
+  try {
+    blob = await blobP;
+    size = await imageSize(blob);
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  }
+  st.imgClip = { pw: size.w, ph: size.h, w: s.rect[2] - s.rect[0], h: s.rect[3] - s.rect[1], blob };
+  if (cut) {
+    if (!await deleteSelectedImage()) return;
+    toast(sys ? 'Obrázok vystrihnutý – vlož ho Ctrl+V.' : 'Obrázok vystrihnutý (vložiť sa dá len v tomto editore).');
+  } else {
+    toast(sys ? 'Obrázok skopírovaný – vlož ho Ctrl+V.' : 'Obrázok skopírovaný (vložiť sa dá len v tomto editore).');
+  }
+}
+
+/** PDF (PyMuPDF) berie spoľahlivo len PNG a JPEG – ostatné formáty prevedieme cez canvas. */
+async function normalizeImage(blob) {
+  const { w, h, img } = await imageSize(blob);
+  if (/^image\/(png|jpeg)$/.test(blob.type)) return { blob, w, h };
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(img, 0, 0);
+  const png = await new Promise(res => c.toBlob(res, 'image/png'));
+  if (!png) throw new Error('Obrázok sa nepodarilo previesť na PNG.');
+  return { blob: png, w, h };
+}
+
+/** Strana a bod (pt), kam vložiť obrázok: pod myšou, inak stred viditeľnej časti aktuálnej strany. */
+function placementTarget() {
+  if (st.hover && st.hover.page < st.info.pages.length) return st.hover;
+  const i = Math.min(st.current, st.info.pages.length - 1);
+  const p = st.info.pages[i];
+  const r = pageEl(i).getBoundingClientRect(), v = viewer.getBoundingClientRect();
+  const top = Math.max(r.top, v.top), bottom = Math.min(r.bottom, v.bottom);
+  const y = bottom > top ? ((top + bottom) / 2 - r.top) / r.height * p.h : p.h / 2;
+  return { page: i, x: p.w / 2, y };
+}
+
+/**
+ * Začne vkladanie obrázka: zobrazí ho na strane, dá sa posúvať a meniť veľkosť,
+ * do PDF sa zapíše až po potvrdení (Enter / Vložiť / klik mimo).
+ * `size` = {w, h} v pt (napr. pôvodná veľkosť obrázka skopírovaného z PDF).
+ */
+async function startPlacement(blob, target = null, size = null) {
+  if (!st.info.open || st.busy) return;
+  await closeEditor(true);
+  cancelPlacement();
+  let n;
+  try {
+    n = await normalizeImage(blob);
+  } catch (e) {
+    toast(e.message, 'error');
+    return;
+  }
+  if (!st.info.open) return;
+  const t = target || placementTarget();
+  const p = st.info.pages[t.page];
+  let { w, h } = size || { w: n.w * 0.75, h: n.h * 0.75 };   // 96 dpi → pt
+  const k = Math.min(1, p.w * 0.8 / w, p.h * 0.8 / h);       // nech sa zmestí na stranu
+  w *= k; h *= k;
+  const x = Math.min(Math.max(0, t.x - w / 2), p.w - w);
+  const y = Math.min(Math.max(0, t.y - h / 2), p.h - h);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'img-place';
+  const url = URL.createObjectURL(n.blob);
+  wrap.innerHTML = `<img alt="" src="${url}"><span class="handle" title="Zmeniť veľkosť (Shift = bez zachovania pomeru)"></span>
+    <div class="editor-bar"><button class="ok" title="Vložiť do PDF (Enter)">${icon('check')}Vložiť</button>
+    <button class="cancel" title="Zrušiť (Esc)">${icon('x')}</button></div>`;
+  pageEl(t.page).appendChild(wrap);
+  st.placing = { page: t.page, x, y, w, h, ratio: w / h, blob: n.blob, url, el: wrap, drag: null };
+  layoutPlacement();
+
+  $('.ok', wrap).onclick = commitPlacement;
+  $('.cancel', wrap).onclick = cancelPlacement;
+  $('.editor-bar', wrap).addEventListener('pointerdown', e => e.stopPropagation());
+  wrap.addEventListener('pointerdown', ev => {
+    const pl = st.placing;
+    if (ev.button !== 0 || !pl) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    wrap.setPointerCapture(ev.pointerId);
+    pl.drag = { resize: ev.target.classList.contains('handle'), cx: ev.clientX, cy: ev.clientY,
+      x: pl.x, y: pl.y, w: pl.w, h: pl.h };
+  });
+  wrap.addEventListener('pointermove', ev => {
+    const pl = st.placing;
+    if (!pl || !pl.drag) return;
+    const d = pl.drag;
+    const dx = (ev.clientX - d.cx) / st.zoom, dy = (ev.clientY - d.cy) / st.zoom;
+    if (d.resize) {
+      pl.w = Math.max(8, d.w + dx);
+      pl.h = ev.shiftKey ? Math.max(8, d.h + dy) : pl.w / pl.ratio;
+    } else {
+      pl.x = d.x + dx;
+      pl.y = d.y + dy;
+    }
+    layoutPlacement();
+  });
+  const end = () => { if (st.placing) st.placing.drag = null; };
+  wrap.addEventListener('pointerup', end);
+  wrap.addEventListener('pointercancel', end);
+  $('#hint').textContent = 'Posuň obrázok myšou, rohom zmeň veľkosť (Shift = voľne) · Enter = vložiť · Esc = zrušiť.';
+}
+
+function layoutPlacement() {
+  const pl = st.placing;
+  if (!pl) return;
+  Object.assign(pl.el.style, {
+    left: pl.x * st.zoom + 'px', top: pl.y * st.zoom + 'px',
+    width: pl.w * st.zoom + 'px', height: pl.h * st.zoom + 'px',
+  });
+}
+
+function cancelPlacement() {
+  const pl = st.placing;
+  if (!pl) return;
+  st.placing = null;
+  pl.el.remove();
+  URL.revokeObjectURL(pl.url);
+  $('#hint').textContent = HINTS[st.tool] || '';
+}
+
+async function commitPlacement() {
+  const pl = st.placing;
+  if (!pl || st.busy) return;
+  const fd = new FormData();
+  fd.append('file', pl.blob, pl.blob.type === 'image/jpeg' ? 'obrazok.jpg' : 'obrazok.png');
+  fd.append('page', pl.page);
+  fd.append('rect', JSON.stringify([pl.x, pl.y, pl.x + pl.w, pl.y + pl.h]));
+  cancelPlacement();
+  await mutate('insert_image', fd, true);
+}
+
+/** Ctrl+V: obrázok zo systémovej schránky, inak naposledy skopírovaný obrázok z PDF. */
+document.addEventListener('paste', async e => {
+  if (e.target.matches?.('input, textarea, select') || !st.info.open) return;
+  const file = [...(e.clipboardData?.items || [])]
+    .find(it => it.kind === 'file' && it.type.startsWith('image/'))?.getAsFile();
+  const clip = st.imgClip;
+  if (!file && !clip) {
+    toast('Schránka neobsahuje obrázok. Skopíruj obrázok (napr. výstrižok obrazovky alebo obrázok z webu) a skús znova.');
+    return;
+  }
+  e.preventDefault();
+  let size = null;
+  if (clip) {
+    // ten istý obrázok, ktorý sme skopírovali z PDF → vložíme ho v pôvodnej veľkosti
+    let same = !file;
+    if (file) {
+      try {
+        const s = await imageSize(file);
+        same = s.w === clip.pw && s.h === clip.ph;
+      } catch { /* chybu ohlási startPlacement */ }
+    }
+    if (same) size = { w: clip.w, h: clip.h };
+  }
+  startPlacement(file || clip.blob, null, size);
+});
+
+$('#btnImage').onclick = () => { if (st.info.open) $('#fileImage').click(); };
+$('#fileImage').onchange = e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (f) startPlacement(f);
+};
 
 /* =========================================================================
    Textový editor (úprava existujúceho aj nový text)
@@ -803,6 +1067,8 @@ function saveView() {
 }
 
 function clearViewer() {
+  cancelPlacement();
+  st.hover = null;
   [...pagesEl.children].forEach(el => io.unobserve(el));
   pagesEl.innerHTML = '';
   thumbsEl.innerHTML = '';
@@ -837,7 +1103,7 @@ async function switchDoc(id, info = null) {
 async function closeDoc(id) {
   const tab = st.docs.find(d => d.id === id);
   if (!tab || st.busy) return;
-  if (tab.dirty && !confirm(`„${tab.name}“ má neuložené zmeny. Zavrieť bez uloženia?`)) return;
+  if (tab.dirty && !confirm(`„${tab.name}“ má zmeny, ktoré si ešte nestiahol cez Uložiť. Zavretím sa zmaže aj automatická záloha. Zavrieť?`)) return;
   if (id === st.docId) await closeEditor(false);
   try { await api(docBase(id), { method: 'DELETE' }); } catch { /* na serveri už nie je */ }
   const idx = st.docs.indexOf(tab);
@@ -861,7 +1127,7 @@ function renderTabs() {
   st.docs.forEach((d, k) => {
     const t = document.createElement('div');
     t.className = 'tab' + (d.id === st.docId ? ' active' : '') + (d.dirty ? ' dirty' : '');
-    t.title = `${d.name} · ${d.pageCount} str.${d.dirty ? ' · neuložené zmeny' : ''}${k < 9 ? ` (Alt+${k + 1})` : ''}`;
+    t.title = `${d.name} · ${d.pageCount} str.${d.dirty ? ' · zmeny ešte nie sú stiahnuté do PDF (záloha je uložená)' : ''}${k < 9 ? ` (Alt+${k + 1})` : ''}`;
     t.innerHTML = `<span class="tab-name"></span><span class="tab-dot" title="Neuložené zmeny"></span>
       <button class="tab-close" title="Zavrieť">${icon('x')}</button>`;
     $('.tab-name', t).textContent = d.name;
@@ -961,11 +1227,22 @@ document.addEventListener('keydown', e => {
     return;
   }
   if (typing) return;
+  if (st.placing) {
+    if (e.key === 'Enter') { e.preventDefault(); commitPlacement(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelPlacement(); }
+    return;
+  }
+  if (mod && st.selImage && ['c', 'x'].includes(e.key.toLowerCase())) {
+    e.preventDefault();
+    copyImage(e.key.toLowerCase() === 'x');
+    return;
+  }
   if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
   if (mod && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
   if (mod) return;
   if ((e.key === 'Delete' || e.key === 'Backspace') && st.selAnnot) { e.preventDefault(); deleteSelectedAnnot(); return; }
-  if (e.key === 'Escape') { st.selAnnot = null; renderAllOverlays(); return; }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && st.selImage) { e.preventDefault(); deleteSelectedImage(); return; }
+  if (e.key === 'Escape') { st.selAnnot = null; st.selImage = null; renderAllOverlays(); return; }
   if (e.key === 'PageDown') { e.preventDefault(); scrollToPage(Math.min(st.current + 1, st.info.pages.length - 1)); return; }
   if (e.key === 'PageUp') { e.preventDefault(); scrollToPage(Math.max(st.current - 1, 0)); return; }
   const t = TOOL_KEYS[e.key.toLowerCase()];
@@ -981,7 +1258,16 @@ window.addEventListener('drop', e => {
   e.preventDefault();
   dragDepth = 0;
   document.body.classList.remove('dragging');
-  openFiles(e.dataTransfer.files);
+  const files = [...e.dataTransfer.files];
+  const img = files.find(f => f.type.startsWith('image/'));
+  if (img && !files.some(isPdf)) {
+    // obrázok pustený na stranu → vloží sa tam, kde bol pustený
+    if (!st.info.open) { toast('Najprv otvor PDF, potom doň vlož obrázok.', 'error'); return; }
+    const pg = e.target.closest?.('.page');
+    startPlacement(img, pg ? { page: +pg.dataset.i, ...pointFromEvent(e, +pg.dataset.i) } : null);
+    return;
+  }
+  openFiles(files);
 });
 
 // Dokumenty žijú na serveri, obnovenie stránky ich nestratí – varujeme len pre istotu.
@@ -996,7 +1282,10 @@ window.addEventListener('beforeunload', e => {
     // obnoví záložky, ktoré sú na serveri ešte otvorené (napr. po F5)
     const res = await api('/api/docs');
     st.fonts = res.fonts || [];
-    st.docs = res.docs;
+    // ak medzitým používateľ už otvoril súbor, jeho záložky nesmú zmiznúť ani sa zdvojiť
+    st.docs = [...res.docs, ...st.docs.filter(d => !res.docs.some(r => r.id === d.id))];
+    renderTabs();
+    if (st.docId) return;
     let last = null;
     try { last = sessionStorage.getItem('pe.doc'); } catch { /* bez úložiska */ }
     const first = st.docs.find(d => d.id === last) || st.docs[0];
